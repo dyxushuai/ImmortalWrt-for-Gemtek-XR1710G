@@ -31,6 +31,7 @@ required_packages=(
 	ddns-scripts-services
 	dropbear
 	haproxy
+	htop
 	kmod-macvlan
 	kmod-nft-offload
 	luci-app-airoha-fancontrol

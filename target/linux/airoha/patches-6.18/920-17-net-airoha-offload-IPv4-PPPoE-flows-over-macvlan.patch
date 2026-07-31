@@ -1,0 +1,503 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: dyxushuai <dyxushuai@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 23:05:00 +0800
+Subject: [PATCH] net: airoha: offload IPv4 PPPoE flows over macvlan
+
+Resolve stacked macvlan output devices to their lower GDM device when
+programming bidirectional IPv4 flow pairs. Keep the flow source address so
+PPPoE sessions retain their macvlan identity. Reject IPv6 macvlan offload
+because IPv6 FOE entries select a physical source address from UPDMEM.
+
+Cache physical and upper unicast addresses for each GDM device and
+aggregate all WAN addresses before programming the global FE WAN MAC
+range. Serialize LAN and WAN FE register programming through a shared
+updater so address and role changes cannot restore a stale physical-only
+WAN range.
+
+Use upper unicast ranges only for WAN. Keep LAN FE programming
+physical-only to preserve existing bridge, VRRP, DSA and management
+behavior. Retain the default unicast-promiscuous fallback because the FE
+can encode only one prefix and one continuous range; this keeps unmatched
+or conflicting addresses reachable in software.
+
+Warn when the selected WAN interval is sparse or when upper and physical
+OUIs differ. Prefer the WAN upper range when it is representable so
+macvlan PPPoE receive traffic can reach PPE, while the unchanged
+promiscuous fallback preserves physical-address reachability.
+
+Signed-off-by: dyxushuai <dyxushuai@users.noreply.github.com>
+---
+ drivers/net/ethernet/airoha/airoha_eth.c | 338 ++++++++++++++++++++---
+ drivers/net/ethernet/airoha/airoha_eth.h |  19 ++
+ drivers/net/ethernet/airoha/airoha_ppe.c |  15 +-
+ 3 files changed, 329 insertions(+), 43 deletions(-)
+
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index 0b93777..06546ad 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -75,16 +75,173 @@ static void airoha_qdma_irq_disable(struct airoha_irq_bank *irq_bank,
+ 	airoha_qdma_set_irqmask(irq_bank, index, mask, 0);
+ }
+ 
++static bool
++__airoha_update_fe_mac_range(struct airoha_eth *eth,
++			     struct airoha_gdm_dev *changed_dev,
++			     bool lan);
++
+ static int airoha_set_macaddr(struct airoha_gdm_dev *dev, const u8 *addr)
+ {
+-	u8 ref_addr[ETH_ALEN] __aligned(2);
++	u8 old_hw_addr[ETH_ALEN];
+ 	struct airoha_eth *eth = dev->eth;
+-	u32 reg, val, lmin, lmax;
++	bool old_hw_addr_valid;
++	bool lan = airoha_is_lan_gdm_dev(dev);
++	bool role_changed;
++
++	/* FE programming uses locked hw_addr / upper-UC caches. Do not scan
++	 * peer netdev->dev_addr outside mac_lock.
++	 */
++	spin_lock_bh(&eth->mac_lock);
++	old_hw_addr_valid = dev->hw_addr_valid;
++	if (old_hw_addr_valid)
++		ether_addr_copy(old_hw_addr, dev->hw_addr);
++	ether_addr_copy(dev->hw_addr, addr);
++	dev->hw_addr_valid = true;
++
++	if (!__airoha_update_fe_mac_range(eth, dev, lan)) {
++		if (old_hw_addr_valid)
++			ether_addr_copy(dev->hw_addr, old_hw_addr);
++		dev->hw_addr_valid = old_hw_addr_valid;
++		spin_unlock_bh(&eth->mac_lock);
++		return -EINVAL;
++	}
++
++	/* Refresh the opposite role only when this device left that role. */
++	role_changed = dev->fe_role_valid && dev->fe_role_lan != lan;
++	dev->fe_role_lan = lan;
++	dev->fe_role_valid = true;
++	if (role_changed)
++		__airoha_update_fe_mac_range(eth, NULL, !lan);
++	spin_unlock_bh(&eth->mac_lock);
++
++	airoha_ppe_init_upd_mem(dev, addr);
++
++	return 0;
++}
++
++struct airoha_mac_range {
++	u8 prefix[3];
++	u32 lmin;
++	u32 lmax;
++	u32 count;
++	bool valid;
++};
++
++static u32 airoha_mac_l3(const u8 *addr)
++{
++	return (addr[3] << 16) | (addr[4] << 8) | addr[5];
++}
++
++static bool airoha_mac_range_add(struct airoha_mac_range *range,
++				 const u8 *addr)
++{
++	u32 val = airoha_mac_l3(addr);
++
++	if (!range->valid) {
++		memcpy(range->prefix, addr, sizeof(range->prefix));
++		range->lmin = val;
++		range->lmax = val;
++		range->count = 1;
++		range->valid = true;
++		return true;
++	}
++
++	if (memcmp(range->prefix, addr, sizeof(range->prefix)))
++		return false;
++
++	if (val < range->lmin)
++		range->lmin = val;
++	if (val > range->lmax)
++		range->lmax = val;
++	range->count++;
++
++	return true;
++}
++
++/* Expand an existing range to cover @addr without double-counting when the
++ * address already lies inside the continuous span (e.g. physical already
++ * present as an upper UC entry).
++ */
++static bool airoha_mac_range_include(struct airoha_mac_range *range,
++				     const u8 *addr)
++{
++	u32 val = airoha_mac_l3(addr);
++
++	if (!range->valid)
++		return airoha_mac_range_add(range, addr);
++
++	if (memcmp(range->prefix, addr, sizeof(range->prefix)))
++		return false;
++
++	if (val >= range->lmin && val <= range->lmax)
++		return true;
++
++	if (val < range->lmin)
++		range->lmin = val;
++	if (val > range->lmax)
++		range->lmax = val;
++	range->count++;
++
++	return true;
++}
++
++static bool airoha_mac_range_merge(struct airoha_mac_range *dst,
++				   const struct airoha_mac_range *src)
++{
++	if (!src->valid)
++		return true;
++
++	if (!dst->valid) {
++		*dst = *src;
++		return true;
++	}
++
++	if (memcmp(dst->prefix, src->prefix, sizeof(dst->prefix)))
++		return false;
++
++	if (src->lmin < dst->lmin)
++		dst->lmin = src->lmin;
++	if (src->lmax > dst->lmax)
++		dst->lmax = src->lmax;
++	/* Prefer under-count so sparse-range warnings stay sensitive when
++	 * multi-device UC spans overlap. Over-count would suppress them.
++	 */
++	if (src->count > dst->count)
++		dst->count = src->count;
++
++	return true;
++}
++
++static bool airoha_gdm_dev_in_mac_role(struct airoha_gdm_dev *dev,
++				       struct airoha_gdm_dev *changed_dev,
++				       bool lan)
++{
++	struct net_device *netdev;
++
++	if (!dev || airoha_is_lan_gdm_dev(dev) != lan || !dev->hw_addr_valid)
++		return false;
++
++	netdev = netdev_from_priv(dev);
++	return dev == changed_dev ||
++	       netdev->reg_state == NETREG_REGISTERED;
++}
++
++/* Caller must hold eth->mac_lock. */
++static bool
++__airoha_update_fe_mac_range(struct airoha_eth *eth,
++			     struct airoha_gdm_dev *changed_dev,
++			     bool lan)
++{
++	const u8 *phys_addrs[AIROHA_MAX_NUM_GDM_PORTS * AIROHA_MAX_NUM_GDM_DEVS];
++	struct airoha_mac_range upper = {}, physical = {}, selected;
++	bool upper_conflict = false;
++
++	const char *role = lan ? "LAN" : "WAN";
++	u32 reg = lan ? REG_FE_LAN_MAC_H : REG_FE_WAN_MAC_H;
++	unsigned int n_phys = 0;
+ 	int i;
+ 
+-	eth_zero_addr(ref_addr);
+-	lmin = (addr[3] << 16) | (addr[4] << 8) | addr[5];
+-	lmax = lmin;
++	lockdep_assert_held(&eth->mac_lock);
+ 
+ 	for (i = 0; i < ARRAY_SIZE(eth->ports); i++) {
+ 		struct airoha_gdm_port *port = eth->ports[i];
+@@ -94,57 +251,109 @@ static int airoha_set_macaddr(struct airoha_gdm_dev *dev, const u8 *addr)
+ 			continue;
+ 
+ 		for (j = 0; j < ARRAY_SIZE(port->devs); j++) {
+-			struct airoha_gdm_dev *iter_dev;
+-			struct net_device *netdev;
++			struct airoha_gdm_dev *dev = port->devs[j];
++			struct airoha_mac_range uc;
+ 
+-			iter_dev = port->devs[j];
+-			if (!iter_dev || iter_dev == dev)
++			if (!airoha_gdm_dev_in_mac_role(dev, changed_dev, lan))
+ 				continue;
+ 
+-			if (airoha_is_lan_gdm_dev(iter_dev) !=
+-			    airoha_is_lan_gdm_dev(dev))
++			if (!airoha_mac_range_add(&physical, dev->hw_addr)) {
++				dev_warn_ratelimited(eth->dev,
++						     "%s physical MAC prefixes differ; keeping the previous hardware range\n",
++						     role);
++				return false;
++			}
++
++			if (n_phys < ARRAY_SIZE(phys_addrs))
++				phys_addrs[n_phys++] = dev->hw_addr;
++
++			/* Upper unicast matching is required for WAN macvlan
++			 * sessions. Keep LAN FE programming physical-only to
++			 * preserve the existing bridge, VRRP and DSA behavior.
++			 */
++			if (lan)
+ 				continue;
+ 
+-			netdev = netdev_from_priv(iter_dev);
+-			if (netdev->reg_state != NETREG_REGISTERED)
++			if (dev->uc_conflict) {
++				upper_conflict = true;
+ 				continue;
++			}
+ 
+-			ether_addr_copy(ref_addr, netdev->dev_addr);
+-			val = (netdev->dev_addr[3] << 16) |
+-			      (netdev->dev_addr[4] << 8) | netdev->dev_addr[5];
+-			if (val < lmin)
+-				lmin = val;
+-			if (val > lmax)
+-				lmax = val;
++			if (!dev->uc_valid)
++				continue;
++
++			uc = (struct airoha_mac_range){
++				.prefix = { dev->uc_prefix[0],
++					    dev->uc_prefix[1],
++					    dev->uc_prefix[2] },
++				.lmin = dev->uc_lmin,
++				.lmax = dev->uc_lmax,
++				.count = dev->uc_count,
++				.valid = true,
++			};
++			if (!airoha_mac_range_merge(&upper, &uc))
++				upper_conflict = true;
+ 		}
+ 	}
+ 
+-	if (!is_zero_ether_addr(ref_addr) && memcmp(ref_addr, addr, 3)) {
+-		/* According to the HW design, hw mac address MSBs must be
+-		 * the same for each net_device with the same LAN/WAN
+-		 * configuration.
+-		 */
+-		struct net_device *netdev = netdev_from_priv(dev);
++	if (upper.valid && !upper_conflict) {
++		selected = upper;
+ 
+-		dev_warn(eth->dev,
+-			 "%s: wrong mac addr, MSBs must be %02x:%02x:%02x\n",
+-			 netdev->name, ref_addr[0], ref_addr[1],
+-			 ref_addr[2]);
+-		dev_warn(eth->dev, "FE hw forwarding won't work properly\n");
++		/* Preserve acceleration for matching physical addresses. */
++		for (i = 0; i < n_phys; i++) {
++			if (memcmp(selected.prefix, phys_addrs[i],
++				   sizeof(selected.prefix)))
++				continue;
++			airoha_mac_range_include(&selected, phys_addrs[i]);
++		}
+ 
+-		return -EINVAL;
++		/* FE holds one global 3-byte prefix per role. Prefer upper so
++		 * macvlan/session MACs hit PPE; make demotion of a
++		 * different-OUI physical address observable.
++		 */
++		if (physical.valid &&
++		    memcmp(physical.prefix, selected.prefix,
++			   sizeof(physical.prefix)))
++			dev_warn_ratelimited(eth->dev,
++					     "%s upper unicast OUI differs from physical; physical addresses leave the hardware MAC range and use software receive\n",
++					     role);
++	} else {
++		selected = physical;
+ 	}
+ 
+-	reg = airoha_is_lan_gdm_dev(dev) ? REG_FE_LAN_MAC_H : REG_FE_WAN_MAC_H;
+-	val = (addr[0] << 16) | (addr[1] << 8) | addr[2];
+-	airoha_fe_wr(eth, reg, val);
+-
+-	airoha_fe_wr(eth, REG_FE_MAC_LMIN(reg), lmin);
+-	airoha_fe_wr(eth, REG_FE_MAC_LMAX(reg), lmax);
+-
+-	airoha_ppe_init_upd_mem(dev, addr);
+-
+-	return 0;
++	if (!selected.valid)
++		return true;
++
++	if (upper_conflict)
++		dev_warn_ratelimited(eth->dev,
++				     "%s upper unicast MAC prefixes differ; upper traffic will use software receive fallback\n",
++				     role);
++	if (selected.lmax - selected.lmin + 1 > selected.count)
++		dev_warn_ratelimited(eth->dev,
++				     "%s MAC match range is sparse (%u entries span %u addresses); unrelated addresses may reach PPE lookup\n",
++				     role, selected.count,
++				     selected.lmax - selected.lmin + 1);
++
++	if (eth->fe_mac_prog[lan].valid &&
++	    !memcmp(eth->fe_mac_prog[lan].prefix, selected.prefix,
++		    sizeof(eth->fe_mac_prog[lan].prefix)) &&
++	    eth->fe_mac_prog[lan].lmin == selected.lmin &&
++	    eth->fe_mac_prog[lan].lmax == selected.lmax)
++		return true;
++
++	airoha_fe_wr(eth, reg,
++		     (selected.prefix[0] << 16) |
++		     (selected.prefix[1] << 8) | selected.prefix[2]);
++	airoha_fe_wr(eth, REG_FE_MAC_LMIN(reg), selected.lmin);
++	airoha_fe_wr(eth, REG_FE_MAC_LMAX(reg), selected.lmax);
++
++	memcpy(eth->fe_mac_prog[lan].prefix, selected.prefix,
++	       sizeof(eth->fe_mac_prog[lan].prefix));
++	eth->fe_mac_prog[lan].lmin = selected.lmin;
++	eth->fe_mac_prog[lan].lmax = selected.lmax;
++	eth->fe_mac_prog[lan].valid = true;
++
++	return true;
+ }
+ 
+ static void airoha_set_gdm_port_fwd_cfg(struct airoha_eth *eth, u32 addr,
+@@ -2228,6 +2437,48 @@ static int airoha_dev_set_macaddr(struct net_device *netdev, void *p)
+ 	return 0;
+ }
+ 
++static void airoha_dev_set_rx_mode(struct net_device *netdev)
++{
++	struct airoha_gdm_dev *dev = netdev_priv(netdev);
++	struct airoha_mac_range upper = {};
++	struct netdev_hw_addr *ha;
++	bool conflict = false;
++	bool lan = airoha_is_lan_gdm_dev(dev);
++
++	/* netif core already holds addr_list_lock; snapshot then take mac_lock. */
++	netdev_for_each_uc_addr(ha, netdev)
++		if (!airoha_mac_range_add(&upper, ha->addr))
++			conflict = true;
++
++	spin_lock_bh(&dev->eth->mac_lock);
++	if (conflict == dev->uc_conflict &&
++	    upper.valid == dev->uc_valid &&
++	    (!upper.valid ||
++	     (!memcmp(dev->uc_prefix, upper.prefix, sizeof(dev->uc_prefix)) &&
++	      dev->uc_lmin == upper.lmin &&
++	      dev->uc_lmax == upper.lmax &&
++	      dev->uc_count == upper.count))) {
++		spin_unlock_bh(&dev->eth->mac_lock);
++		return;
++	}
++
++	if (upper.valid) {
++		memcpy(dev->uc_prefix, upper.prefix, sizeof(dev->uc_prefix));
++		dev->uc_lmin = upper.lmin;
++		dev->uc_lmax = upper.lmax;
++		dev->uc_count = upper.count;
++	} else {
++		memset(dev->uc_prefix, 0, sizeof(dev->uc_prefix));
++		dev->uc_lmin = 0;
++		dev->uc_lmax = 0;
++		dev->uc_count = 0;
++	}
++	dev->uc_valid = upper.valid;
++	dev->uc_conflict = conflict;
++	__airoha_update_fe_mac_range(dev->eth, NULL, lan);
++	spin_unlock_bh(&dev->eth->mac_lock);
++}
++
+ static int airoha_enable_gdm2_loopback(struct airoha_gdm_dev *dev)
+ {
+ 	struct airoha_gdm_port *port = dev->port;
+@@ -3637,6 +3888,7 @@ static const struct net_device_ops airoha_netdev_ops = {
+ 	.ndo_start_xmit		= airoha_dev_xmit,
+ 	.ndo_get_stats64        = airoha_dev_get_stats64,
+ 	.ndo_set_mac_address	= airoha_dev_set_macaddr,
++	.ndo_set_rx_mode	= airoha_dev_set_rx_mode,
+ 	.ndo_setup_tc		= airoha_dev_tc_setup,
+ };
+ 
+@@ -4038,6 +4290,8 @@ static int airoha_probe(struct platform_device *pdev)
+ 	if (!eth)
+ 		return -ENOMEM;
+ 
++	spin_lock_init(&eth->mac_lock);
++
+ 	eth->soc = of_device_get_match_data(&pdev->dev);
+ 	if (!eth->soc)
+ 		return -EINVAL;
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index 9fd3eb8..36e02e9 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -565,6 +565,16 @@ struct airoha_gdm_dev {
+ 	u64 fwd_tx_packets;
+ 
+ 	u32 flags;
++	u32 uc_lmin;
++	u32 uc_lmax;
++	u32 uc_count;
++	u8 uc_prefix[3];
++	u8 hw_addr[ETH_ALEN];
++	bool uc_valid;
++	bool uc_conflict;
++	bool hw_addr_valid;
++	bool fe_role_lan;
++	bool fe_role_valid;
+ 	int nbq;
+ 
+ 	struct airoha_hw_stats stats;
+@@ -624,6 +634,15 @@ struct airoha_eth {
+ 	const struct airoha_eth_soc_data *soc;
+ 
+ 	unsigned long state;
++	/* protects FE MAC regs, physical hw_addr caches, and upper UC caches */
++	spinlock_t mac_lock;
++	/* last programmed FE LAN (index 1) / WAN (index 0) MAC ranges */
++	struct {
++		u8 prefix[3];
++		u32 lmin;
++		u32 lmax;
++		bool valid;
++	} fe_mac_prog[2];
+ 	void __iomem *fe_regs;
+ 
+ 	struct airoha_npu __rcu *npu;
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
+index 7bfb1b7..b3ca5a3 100644
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <linux/ip.h>
++#include <linux/if_macvlan.h>
+ #include <linux/ipv6.h>
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+@@ -359,10 +360,22 @@ static int airoha_ppe_foe_entry_prepare(struct airoha_eth *eth,
+ 					int l4proto, u8 dsfield)
+ {
+ 	u32 qdata = FIELD_PREP(AIROHA_FOE_SHAPER_ID, 0x7f), ports_pad, val;
+-	int wlan_etype = -EINVAL, dsa_port = airoha_get_dsa_port(&netdev);
++	int wlan_etype = -EINVAL, dsa_port;
+ 	struct airoha_foe_mac_info_common *l2;
+ 	u8 smac_id = 0xf;
+ 
++	if (netdev && netif_is_macvlan(netdev)) {
++		/* IPv6 FOE uses physical UPDMEM; reject before unwrap. */
++		if (type >= PPE_PKT_TYPE_IPV6_ROUTE_3T)
++			return -EOPNOTSUPP;
++
++		do {
++			netdev = macvlan_dev_real_dev(netdev);
++		} while (netdev && netif_is_macvlan(netdev));
++	}
++
++	dsa_port = airoha_get_dsa_port(&netdev);
++
+ 	memset(hwe, 0, sizeof(*hwe));
+ 
+ 	val = FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE, AIROHA_FOE_STATE_BIND) |
