@@ -1,0 +1,75 @@
+From: Gilly <gilly@example.com>
+Date: Fri, 17 Apr 2026 00:00:00 +0000
+Subject: [PATCH] net: airoha: ppe: initialize PPE at TC block bind
+
+In bridge/AP mode, the software bridge FDB can be empty when forwarding is
+offloaded to switchdev. In that case no TC flower rule reaches the lazy PPE
+initialization path and the PPE remains unconfigured.
+
+Start PPE offload when fw4 binds the flow block to the Airoha device. The
+helper is idempotent and remains protected by the existing offload mutex.
+
+Signed-off-by: Gilly <gilly@example.com>
+---
+ drivers/net/ethernet/airoha/airoha_eth.c |  8 ++++++++
+ drivers/net/ethernet/airoha/airoha_eth.h |  1 +
+ drivers/net/ethernet/airoha/airoha_ppe.c | 13 +++++++++++++
+ 3 files changed, 22 insertions(+)
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -3002,7 +3002,9 @@ static int airoha_dev_setup_tc_block(str
+ 				     struct flow_block_offload *f)
+ {
+ 	flow_setup_cb_t *cb = airoha_dev_setup_tc_block_cb;
++	struct airoha_gdm_dev *gdm_dev = netdev_priv(dev);
+ 	static LIST_HEAD(block_cb_list);
++	struct airoha_eth *eth = gdm_dev->eth;
+ 	struct flow_block_cb *block_cb;
+ 
+ 	if (f->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
+@@ -3023,6 +3025,12 @@ static int airoha_dev_setup_tc_block(str
+ 		flow_block_cb_incref(block_cb);
+ 		flow_block_cb_add(block_cb, f);
+ 		list_add_tail(&block_cb->driver_list, &block_cb_list);
++		/*
++		 * Initialize PPE even when an offloaded bridge leaves the
++		 * software FDB empty and no flower rule reaches lazy setup.
++		 */
++		airoha_ppe_start_offload(eth);
++
+ 		return 0;
+ 	case FLOW_BLOCK_UNBIND:
+ 		block_cb = flow_block_cb_lookup(f->block, cb, dev);
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -685,6 +685,7 @@ bool airoha_ppe_is_enabled(struct airoha
+ void airoha_ppe_check_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+ 			  u16 hash, bool rx_wlan);
+ int airoha_ppe_setup_tc_block_cb(struct airoha_ppe_dev *dev, void *type_data);
++void airoha_ppe_start_offload(struct airoha_eth *eth);
+ int airoha_ppe_init(struct airoha_eth *eth);
+ void airoha_ppe_deinit(struct airoha_eth *eth);
+ void airoha_ppe_init_upd_mem(struct airoha_gdm_dev *dev, const u8 *addr);
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -97,6 +97,19 @@ void airoha_ppe_set_cpu_port(struct airo
+ 		      __field_prep(DFT_CPORT_MASK(fport), fe_cpu_port));
+ }
+ 
++static int airoha_ppe_offload_setup(struct airoha_eth *eth);
++
++void airoha_ppe_start_offload(struct airoha_eth *eth)
++{
++	if (!test_bit(DEV_STATE_REGISTERED, &eth->state))
++		return;
++
++	mutex_lock(&flow_offload_mutex);
++	if (!eth->npu)
++		airoha_ppe_offload_setup(eth);
++	mutex_unlock(&flow_offload_mutex);
++}
++
+ static void airoha_ppe_hw_init(struct airoha_ppe *ppe)
+ {
+ 	u32 sram_ppe_num_data_entries = PPE_SRAM_NUM_ENTRIES, sram_num_entries;
