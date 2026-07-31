@@ -33,49 +33,76 @@ jobs:
       - name: Get current date
         id: date
         run: |
-          echo "date=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
+          echo "date=$(date +'%Y%m%d')" >> "$GITHUB_OUTPUT"
 
       - name: Get commit hash
         id: commit
         run: |
-          echo "short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
-          echo "full=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "full=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      - name: Setup build environment
-        run: |
-          sudo apt update
-          sudo apt install -y build-essential clang gcc g++ binutils bzip2 gawk gettext git libncurses-dev libssl-dev python3 python3-setuptools rsync unzip wget xsltproc zlib1g-dev file which perl sed make
+      - name: Cache downloads
+        uses: actions/cache@v5
+        with:
+          path: dl
+          key: xr1710g-dl-${{ hashFiles('feeds.conf.default', 'config.seed') }}
+          restore-keys: |
+            xr1710g-dl-
 
-      - name: Install feeds
+      - name: Build container image
         run: |
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
+          docker build \
+            --tag xr1710g-openwrt-builder:ubuntu-24.04 \
+            tools/docker/openwrt-build
+
+      - name: Import packages and install feeds
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/tmp \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --workdir /workspace \
+            xr1710g-openwrt-builder:ubuntu-24.04 \
+            bash -lc '
+              ./scripts/import-migration-packages.sh
+              ./scripts/feeds update -a
+              ./scripts/feeds install -a
+            '
 
       - name: Configure
         run: |
-          cp config.seed .config
-          make defconfig
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/tmp \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --workdir /workspace \
+            xr1710g-openwrt-builder:ubuntu-24.04 \
+            bash -lc 'cp config.seed .config && make defconfig'
 
       - name: Download sources
-        run: make download -j$(nproc)
+        run: |
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/tmp \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --workdir /workspace \
+            xr1710g-openwrt-builder:ubuntu-24.04 \
+            bash -lc 'make download -j"$(nproc)"'
 
       - name: Build Firmware
         run: |
-          make -j2 world 2>&1 | tee build.log
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/tmp \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --workdir /workspace \
+            xr1710g-openwrt-builder:ubuntu-24.04 \
+            bash -o pipefail -lc 'make -j"$(nproc)" world 2>&1 | tee build.log'
 
-      - name: Check build status
+      - name: Validate build
         run: |
-          if [ -f build.log ]; then
-            tail -100 build.log
-          fi
-          echo "=== List all files in bin/targets/airoha/an7581/ ==="
-          ls -la bin/targets/airoha/an7581/ 2>/dev/null || echo "No files found in an7581 directory"
-          echo "=== List all files in bin/targets/airoha/ ==="
-          ls -la bin/targets/airoha/ 2>/dev/null || echo "No files found in airoha directory"
-          echo "=== List all files in bin/targets/ ==="
-          ls -la bin/targets/ 2>/dev/null || echo "No files found in targets directory"
-          echo "=== List all files in bin/ ==="
-          ls -la bin/ 2>/dev/null || echo "No files found in bin directory"
+          ./scripts/validate-migration-firmware.sh
+          ls -lh bin/targets/airoha/an7581
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
@@ -87,8 +114,12 @@ jobs:
             bin/targets/airoha/an7581/feeds.buildinfo
             bin/targets/airoha/an7581/version.buildinfo
             bin/targets/airoha/an7581/sha256sums
+            bin/targets/airoha/an7581/profiles.json
+            bin/targets/airoha/an7581/*.manifest
+            bin/packages/aarch64_cortex-a53/base/luci-app-mwan3helper-*.apk
+            bin/packages/aarch64_cortex-a53/base/luci-i18n-mwan3helper-zh-cn-*.apk
+            bin/packages/aarch64_cortex-a53/base/pdnsd-alt-*.apk
           retention-days: 30
-        if: always()
 
       - name: Create Release
         if: github.event.inputs.release_type != 'none'
@@ -105,5 +136,10 @@ jobs:
             bin/targets/airoha/an7581/feeds.buildinfo
             bin/targets/airoha/an7581/version.buildinfo
             bin/targets/airoha/an7581/sha256sums
+            bin/targets/airoha/an7581/profiles.json
+            bin/targets/airoha/an7581/*.manifest
+            bin/packages/aarch64_cortex-a53/base/luci-app-mwan3helper-*.apk
+            bin/packages/aarch64_cortex-a53/base/luci-i18n-mwan3helper-zh-cn-*.apk
+            bin/packages/aarch64_cortex-a53/base/pdnsd-alt-*.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
