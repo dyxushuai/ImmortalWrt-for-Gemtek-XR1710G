@@ -2218,7 +2218,7 @@ CONFIG_WIFI_SCRIPTS_UCODE=y
 # CONFIG_PACKAGE_fluent-bit is not set
 # CONFIG_PACKAGE_gkrellmd is not set
 # CONFIG_PACKAGE_gotop is not set
-# CONFIG_PACKAGE_htop is not set
+CONFIG_PACKAGE_htop=y
 # CONFIG_PACKAGE_ipmitool is not set
 # CONFIG_PACKAGE_monit is not set
 # CONFIG_PACKAGE_monit-nossl is not set
