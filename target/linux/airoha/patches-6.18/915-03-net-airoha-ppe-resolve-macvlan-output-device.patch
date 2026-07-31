@@ -1,0 +1,56 @@
+From: dyxushuai <dyxushuai@users.noreply.github.com>
+Date: Fri, 31 Jul 2026 20:30:00 +0800
+Subject: [PATCH] net: airoha: ppe: resolve macvlan output devices
+
+PPPoE sessions can use a macvlan device to provide an independent MAC
+address. The flowtable forward path stops at macvlan because it does not
+implement ndo_fill_forward_path, so the redirect action presented to the
+Airoha PPE driver refers to the macvlan device instead of the underlying
+GDM device.
+
+Resolve the macvlan lower device before selecting the PPE output port. The
+flow rule still carries the macvlan source address, so the generated PPE
+IPv4 entry keeps the PPPoE session identity while targeting the physical
+GDM port.
+
+IPv6 PPE entries select their source address from UPDMEM using the physical
+GDM port ID instead of storing the address in the flow entry. Reject IPv6
+offload when the output is a macvlan until its address can be assigned to a
+dedicated UPDMEM slot. This avoids frames using the physical GDM MAC.
+
+Signed-off-by: dyxushuai <dyxushuai@users.noreply.github.com>
+---
+ drivers/net/ethernet/airoha/airoha_ppe.c | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include <linux/ip.h>
++#include <linux/if_macvlan.h>
+ #include <linux/ipv6.h>
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+@@ -359,10 +360,19 @@ static int airoha_ppe_foe_entry_prepare(
+ 					int l4proto, u8 dsfield)
+ {
+ 	u32 qdata = FIELD_PREP(AIROHA_FOE_SHAPER_ID, 0x7f), ports_pad, val;
+-	int wlan_etype = -EINVAL, dsa_port = airoha_get_dsa_port(&netdev);
++	int wlan_etype = -EINVAL, dsa_port;
+ 	struct airoha_foe_mac_info_common *l2;
++	bool is_macvlan = netdev && netif_is_macvlan(netdev);
+ 	u8 smac_id = 0xf;
+ 
++	if (is_macvlan && type >= PPE_PKT_TYPE_IPV6_ROUTE_3T)
++		return -EOPNOTSUPP;
++
++	if (is_macvlan)
++		netdev = macvlan_dev_real_dev(netdev);
++
++	dsa_port = airoha_get_dsa_port(&netdev);
++
+ 	memset(hwe, 0, sizeof(*hwe));
+ 
+ 	val = FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE, AIROHA_FOE_STATE_BIND) |
