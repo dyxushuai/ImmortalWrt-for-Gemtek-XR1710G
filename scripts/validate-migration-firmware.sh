@@ -5,6 +5,10 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 target_dir="$repo_root/bin/targets/airoha/an7581"
 package_dir="$repo_root/bin/packages/aarch64_cortex-a53/base"
 
+"$repo_root/scripts/validate-config-selection.sh" \
+	"$repo_root/config.seed" \
+	"$repo_root/.config"
+
 firmware=("$target_dir"/*gemtek_xr1710g-ubi*squashfs-sysupgrade.itb)
 manifests=("$target_dir"/*gemtek_xr1710g-ubi.manifest)
 
@@ -57,8 +61,6 @@ for package in "${required_packages[@]}"; do
 done
 
 for package in \
-	openssh-client \
-	openssh-keygen \
 	openssh-server \
 	openssh-sftp-server \
 	luci-ssl \
