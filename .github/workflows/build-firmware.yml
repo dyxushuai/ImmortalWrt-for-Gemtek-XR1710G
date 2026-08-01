@@ -69,8 +69,10 @@ jobs:
               ./scripts/feeds install -a
             '
 
-      - name: Test configuration validation
-        run: ./tests/validate-config-selection.sh
+      - name: Test build validation
+        run: |
+          ./tests/validate-config-selection.sh
+          ./tests/validate-migration-package-imports.sh
 
       - name: Configure
         run: |
