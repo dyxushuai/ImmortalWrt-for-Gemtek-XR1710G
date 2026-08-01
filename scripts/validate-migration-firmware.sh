@@ -5,6 +5,8 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 target_dir="$repo_root/bin/targets/airoha/an7581"
 package_dir="$repo_root/bin/packages/aarch64_cortex-a53/base"
 
+"$repo_root/scripts/validate-migration-package-imports.sh"
+
 "$repo_root/scripts/validate-config-selection.sh" \
 	"$repo_root/config.seed" \
 	"$repo_root/.config"
