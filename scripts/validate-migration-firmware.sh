@@ -51,6 +51,7 @@ required_packages=(
 	luci-i18n-mwan3-zh-cn
 	luci-i18n-mwan3helper-zh-cn
 	mwan3
+	openssh-sftp-server
 	pdnsd-alt
 	ppp-mod-pppoe
 	uhttpd
@@ -65,7 +66,6 @@ done
 
 for package in \
 	openssh-server \
-	openssh-sftp-server \
 	luci-ssl \
 	luci-ssl-openssl; do
 	if grep -Fq "$package - " "${manifests[0]}"; then

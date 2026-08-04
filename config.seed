@@ -5693,7 +5693,7 @@ CONFIG_PACKAGE_luci-app-lucky=y
 CONFIG_PACKAGE_luci-app-msd_lite=y
 # CONFIG_PACKAGE_luci-app-music-remote-center is not set
 CONFIG_PACKAGE_luci-app-mlo=y
-# CONFIG_PACKAGE_luci-app-mwan3 is not set
+CONFIG_PACKAGE_luci-app-mwan3=y
 # CONFIG_PACKAGE_luci-app-n2n is not set
 # CONFIG_PACKAGE_luci-app-natmap is not set
 # CONFIG_PACKAGE_luci-app-netdata is not set
@@ -6952,7 +6952,7 @@ CONFIG_PACKAGE_ip-full=y
 # CONFIG_PACKAGE_ip-tiny is not set
 # CONFIG_PACKAGE_lldpd is not set
 # CONFIG_PACKAGE_mrmctl is not set
-# CONFIG_PACKAGE_mwan3 is not set
+CONFIG_PACKAGE_mwan3=y
 # CONFIG_PACKAGE_nstat is not set
 # CONFIG_PACKAGE_olsrd is not set
 # CONFIG_PACKAGE_pbr is not set
@@ -7413,7 +7413,7 @@ CONFIG_PACKAGE_adguardhome=y
 CONFIG_PACKAGE_etherwake=y
 # CONFIG_PACKAGE_etherwake-nfqueue is not set
 # CONFIG_PACKAGE_ethtool is not set
-# CONFIG_PACKAGE_ethtool-full is not set
+CONFIG_PACKAGE_ethtool-full=y
 # CONFIG_PACKAGE_evilginx2 is not set
 # CONFIG_PACKAGE_external-protocol is not set
 # CONFIG_PACKAGE_fail2ban is not set
@@ -7452,7 +7452,7 @@ CONFIG_PACKAGE_etherwake=y
 # CONFIG_PACKAGE_iftop is not set
 # CONFIG_PACKAGE_iiod is not set
 # CONFIG_PACKAGE_iperf is not set
-# CONFIG_PACKAGE_iperf3 is not set
+CONFIG_PACKAGE_iperf3=y
 # CONFIG_PACKAGE_iperf3-ssl is not set
 # CONFIG_PACKAGE_ipip is not set
 # CONFIG_PACKAGE_ipset is not set
@@ -7623,7 +7623,7 @@ CONFIG_PACKAGE_simple-obfs-client=y
 # CONFIG_PACKAGE_tac_plus-pam is not set
 # CONFIG_PACKAGE_tayga is not set
 # CONFIG_PACKAGE_tcp-in-udp is not set
-# CONFIG_PACKAGE_tcpdump is not set
+CONFIG_PACKAGE_tcpdump=y
 # CONFIG_PACKAGE_tcpdump-mini is not set
 CONFIG_PACKAGE_tcping=y
 # CONFIG_PACKAGE_teamd is not set
@@ -8622,3 +8622,11 @@ CONFIG_PACKAGE_watchcat=y
 # CONFIG_PACKAGE_fontconfig is not set
 # end of Font-Utils
 # end of Xorg
+
+#
+# Migration additions
+#
+CONFIG_PACKAGE_luci-i18n-mwan3-zh-cn=y
+CONFIG_PACKAGE_luci-app-mwan3helper=y
+CONFIG_PACKAGE_luci-i18n-mwan3helper-zh-cn=y
+CONFIG_PACKAGE_pdnsd-alt=y
