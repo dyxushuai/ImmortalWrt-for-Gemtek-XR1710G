@@ -145,7 +145,7 @@ if not re.search(
     sys.stderr.write("cross-OUI upper range does not select physical FE fallback\n")
     sys.exit(1)
 if not re.search(
-    r"if\s*\(\s*span\s*>\s*selected\.count.*?\{.*?"
+    r"if\s*\(\s*span\s*>\s*selected\.count.*?"
     r"span\s*>\s*selected\.count\s*\*\s*8.*?"
     r"span\s*>\s*selected\.count\s*\+\s*64.*?"
     r"selected\s*=\s*physical\s*;",
