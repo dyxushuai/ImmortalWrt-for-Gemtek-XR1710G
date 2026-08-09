@@ -20,10 +20,11 @@ behavior. Retain the default unicast-promiscuous fallback because the FE
 can encode only one prefix and one continuous range; this keeps unmatched
 or conflicting addresses reachable in software.
 
-Warn when the selected WAN interval is sparse or when upper and physical
-OUIs differ. Prefer the WAN upper range when it is representable so
-macvlan PPPoE receive traffic can reach PPE, while the unchanged
-promiscuous fallback preserves physical-address reachability.
+Program FE with a WAN upper range only when it shares the physical OUI and
+is dense enough to encode safely (span within a small multiple of the real
+address count). Different OUI or sparse upper sets fall back to physical
+FE programming so macvlan traffic uses software receive instead of opening
+a multi-million-address PPE match window.
 
 Signed-off-by: dyxushuai <dyxushuai@users.noreply.github.com>
 ---

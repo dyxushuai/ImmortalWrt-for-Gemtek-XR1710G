@@ -111,13 +111,49 @@ eth_required = [
     "Keep LAN FE programming physical-only",
     "fe_mac_prog",
     "keeping the previous hardware range",
-    "physical addresses leave the hardware MAC range",
     "software receive fallback",
+    # 920-18: refuse unsafe upper FE programming (cross-OUI / sparse)
+    "keep physical FE range, upper uses software receive",
+    "same_oui",
 ]
 for token in eth_required:
     if token not in eth:
         sys.stderr.write("missing in airoha_eth.c: %s\n" % token)
         sys.exit(1)
+
+# Must not still prefer unsafe upper-only FE ranges.
+if "physical addresses leave the hardware MAC range" in eth:
+    sys.stderr.write(
+        "airoha_eth.c still demotes physical FE range for cross-OUI upper "
+        "(apply 920-18 reject-sparse/cross-oui patch)\n"
+    )
+    sys.exit(1)
+if "unrelated addresses may reach PPE lookup" in eth:
+    sys.stderr.write(
+        "airoha_eth.c still programs sparse upper FE ranges with only a warning "
+        "(apply 920-18 reject-sparse/cross-oui patch)\n"
+    )
+    sys.exit(1)
+
+# 920-18 must fail closed in both unsafe upper-range cases. Token presence
+# alone is not enough: a warning without the physical fallback is a regression.
+if not re.search(
+    r"if\s*\(\s*!same_oui\s*\)\s*\{.*?selected\s*=\s*physical\s*;.*?\}\s*else\s*\{",
+    eth,
+    re.S,
+):
+    sys.stderr.write("cross-OUI upper range does not select physical FE fallback\n")
+    sys.exit(1)
+if not re.search(
+    r"if\s*\(\s*span\s*>\s*selected\.count.*?\{.*?"
+    r"span\s*>\s*selected\.count\s*\*\s*8.*?"
+    r"span\s*>\s*selected\.count\s*\+\s*64.*?"
+    r"selected\s*=\s*physical\s*;",
+    eth,
+    re.S,
+):
+    sys.stderr.write("sparse upper range does not select physical FE fallback\n")
+    sys.exit(1)
 
 if "IFF_UNICAST_FLT" in eth:
     sys.stderr.write(
@@ -194,7 +230,7 @@ for token in hdr_required:
 
 print(
     "Airoha IPv4 macvlan PPE rules, WAN upper-MAC registration, "
-    "physical-only LAN behavior, software fallback, locking, and "
-    "IPv6 guard are present."
+    "physical-only LAN behavior, sparse/cross-OUI FE reject, "
+    "software fallback, locking, and IPv6 guard are present."
 )
 PY

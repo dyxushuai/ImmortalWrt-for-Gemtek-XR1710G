@@ -1,0 +1,126 @@
+From: dyxushuai <dyxushuai@users.noreply.github.com>
+Date: Sun, 9 Aug 2026 00:00:00 +0800
+Subject: [PATCH] net: airoha: reject sparse or cross-OUI FE MAC upper ranges
+
+The FE can only encode one 3-byte prefix and one continuous [lmin,lmax]
+interval per LAN/WAN role. Preferring a dual-WAN macvlan upper set that
+uses a different OUI from the physical WAN address, or that spans far
+more addresses than the real unicast count, programs a huge PPE match
+window and demotes the physical MAC to software receive.
+
+Only program the WAN FE range from upper unicast when:
+  1) upper shares the physical OUI (or there is no physical yet), and
+  2) the continuous span is dense enough (small holes allowed).
+
+Otherwise keep the physical FE range and leave mismatched/sparse upper
+addresses on the software receive path. This preserves IPv4 macvlan FOE
+offload prepare/unwrap while refusing unsafe FE table updates.
+
+Signed-off-by: dyxushuai <dyxushuai@users.noreply.github.com>
+---
+ drivers/net/ethernet/airoha/airoha_eth.c | 60 ++++++++++++++++++++++----------
+ 1 file changed, 38 insertions(+), 22 deletions(-)
+
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -290,44 +290,62 @@
+ 			if (!airoha_mac_range_merge(&upper, &uc))
+ 				upper_conflict = true;
+ 		}
+ 	}
+ 
+-	if (upper.valid && !upper_conflict) {
+-		selected = upper;
+-
+-		/* Preserve acceleration for matching physical addresses. */
+-		for (i = 0; i < n_phys; i++) {
+-			if (memcmp(selected.prefix, phys_addrs[i],
+-				   sizeof(selected.prefix)))
+-				continue;
+-			airoha_mac_range_include(&selected, phys_addrs[i]);
+-		}
+-
+-		/* FE holds one global 3-byte prefix per role. Prefer upper so
+-		 * macvlan/session MACs hit PPE; make demotion of a
+-		 * different-OUI physical address observable.
+-		 */
+-		if (physical.valid &&
+-		    memcmp(physical.prefix, selected.prefix,
+-			   sizeof(physical.prefix)))
+-			dev_warn_ratelimited(eth->dev,
+-					     "%s upper unicast OUI differs from physical; physical addresses leave the hardware MAC range and use software receive\n",
+-					     role);
+-	} else {
+-		selected = physical;
+-	}
+-
+-	if (!selected.valid)
+-		return true;
+-
+-	if (upper_conflict)
+-		dev_warn_ratelimited(eth->dev,
+-				     "%s upper unicast MAC prefixes differ; upper traffic will use software receive fallback\n",
+-				     role);
+-	if (selected.lmax - selected.lmin + 1 > selected.count)
+-		dev_warn_ratelimited(eth->dev,
+-				     "%s MAC match range is sparse (%u entries span %u addresses); unrelated addresses may reach PPE lookup\n",
+-				     role, selected.count,
+-				     selected.lmax - selected.lmin + 1);
+-
++	if (upper.valid && !upper_conflict) {
++		bool same_oui = !physical.valid ||
++				!memcmp(physical.prefix, upper.prefix,
++					sizeof(physical.prefix));
++		u32 span;
++
++		/*
++		 * FE encodes one prefix + one continuous [lmin,lmax]. Prefer
++		 * upper only when safe: same OUI as physical (when present)
++		 * and dense enough that the interval is not a multi-million
++		 * PPE match window for unrelated addresses.
++		 */
++		if (!same_oui) {
++			dev_warn_ratelimited(eth->dev,
++					     "%s upper unicast OUI differs from physical; keep physical FE range, upper uses software receive\n",
++					     role);
++			selected = physical;
++		} else {
++			selected = upper;
++
++			/* Preserve acceleration for matching physical addresses. */
++			for (i = 0; i < n_phys; i++) {
++				if (memcmp(selected.prefix, phys_addrs[i],
++					   sizeof(selected.prefix)))
++					continue;
++				airoha_mac_range_include(&selected,
++								 phys_addrs[i]);
++			}
++
++			span = selected.lmax - selected.lmin + 1;
++			/*
++			 * Allow small holes (e.g. 3 addrs spanning 4) but
++			 * reject pathological dual-WAN pools.
++			 */
++			if (span > selected.count &&
++			    (span > selected.count * 8 ||
++			     span > selected.count + 64)) {
++				dev_warn_ratelimited(eth->dev,
++						     "%s upper MAC range is sparse (%u entries span %u addresses); keep physical FE range, upper uses software receive\n",
++						     role, selected.count,
++						     span);
++				selected = physical;
++			}
++		}
++	} else {
++		selected = physical;
++	}
++
++	if (!selected.valid)
++		return true;
++
++	if (upper_conflict)
++		dev_warn_ratelimited(eth->dev,
++				     "%s upper unicast MAC prefixes differ; upper traffic will use software receive fallback\n",
++				     role);
++
+ 	if (eth->fe_mac_prog[lan].valid &&
